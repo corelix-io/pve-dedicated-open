@@ -1,0 +1,208 @@
+name: Build Release Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v3.0.0)'
+        required: true
+      flavor:
+        description: 'Build flavor: premium (full) or public (stripped)'
+        required: false
+        default: 'premium'
+        type: choice
+        options:
+          - premium
+          - public
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "flavor=${{ github.event.inputs.flavor }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "flavor=premium" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release bundle
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FLAVOR="${{ steps.version.outputs.flavor }}"
+          BUNDLE_NAME="pve-dedicated-${VERSION}"
+
+          mkdir -p "dist/${BUNDLE_NAME}"
+
+          # Copy core project files needed at runtime
+          cp pve-dedicated.sh "dist/${BUNDLE_NAME}/"
+          cp -r lib/ "dist/${BUNDLE_NAME}/lib/"
+          cp -r templates/ "dist/${BUNDLE_NAME}/templates/"
+          cp -r configs/ "dist/${BUNDLE_NAME}/configs/"
+          cp LICENSE "dist/${BUNDLE_NAME}/"
+
+          # Public flavor: strip premium modules and premium-only configs
+          if [[ "$FLAVOR" == "public" ]]; then
+            rm -rf "dist/${BUNDLE_NAME}/lib/premium" || true
+            rm -f "dist/${BUNDLE_NAME}/configs/example-premium-luks.env" || true
+            rm -rf "dist/${BUNDLE_NAME}/templates/premium" || true
+          fi
+
+          # Stamp version into the bundle
+          sed -i "s/PVE_INSTALLER_VERSION=\".*\"/PVE_INSTALLER_VERSION=\"${VERSION#v}\"/" \
+              "dist/${BUNDLE_NAME}/lib/ui.sh"
+
+          # Make scripts executable
+          chmod +x "dist/${BUNDLE_NAME}/pve-dedicated.sh"
+
+          cd dist
+          tar czf "${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}/"
+
+          # Generate the per-release install.sh that downloads THIS exact
+          # bundle. Honors GITHUB_TOKEN when the source repo is private.
+          REPO_FOR_BOOTSTRAP="${{ github.repository }}"
+          cat > "../dist/install.sh" <<INSTALLER
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          REPO="\${PVE_DEDICATED_REPO:-${REPO_FOR_BOOTSTRAP}}"
+          VERSION="${VERSION}"
+          BUNDLE="pve-dedicated-${VERSION}"
+          BROWSER_URL="https://github.com/\${REPO}/releases/download/${VERSION}/\${BUNDLE}.tar.gz"
+          API_RELEASE_URL="https://api.github.com/repos/\${REPO}/releases/tags/${VERSION}"
+
+          AUTH_HEADER=()
+          if [[ -n "\${GITHUB_TOKEN:-}" ]]; then
+              AUTH_HEADER=(-H "Authorization: token \${GITHUB_TOKEN}")
+          fi
+
+          echo ""
+          echo "  pve-dedicated ${VERSION} -- by Corelix.io"
+          if [[ -n "\${GITHUB_TOKEN:-}" ]]; then
+              echo "  Auth: GITHUB_TOKEN present (private/premium build mode)"
+          fi
+          echo ""
+
+          cd /root
+
+          if [[ -n "\${GITHUB_TOKEN:-}" ]]; then
+              # Private repo: resolve the asset API URL, then octet-stream download.
+              if ! command -v python3 >/dev/null 2>&1; then
+                  apt-get -qq update >/dev/null 2>&1 || true
+                  DEBIAN_FRONTEND=noninteractive apt-get -yq install python3 >/dev/null 2>&1 \\
+                      || { echo "ERROR: python3 unavailable, cannot parse release JSON"; exit 1; }
+              fi
+              REL_JSON="\$(curl -4fsSL "\${AUTH_HEADER[@]}" "\$API_RELEASE_URL" 2>/dev/null || true)"
+              if [[ -z "\$REL_JSON" ]] || ! echo "\$REL_JSON" | grep -q '"tag_name"'; then
+                  echo "ERROR: Could not fetch release \${VERSION} from \${REPO}"
+                  echo "       Token may be expired or lack 'Contents: Read' on \${REPO}."
+                  exit 1
+              fi
+              ASSET_API_URL="\$(ASSET_NAME="\${BUNDLE}.tar.gz" python3 -c '
+          import json, os, sys
+          d = json.load(sys.stdin)
+          target = os.environ["ASSET_NAME"]
+          for a in d.get("assets", []):
+              if a["name"] == target:
+                  print(a["url"]); break
+          ' <<< "\$REL_JSON")"
+              if [[ -z "\$ASSET_API_URL" ]]; then
+                  echo "ERROR: Asset \${BUNDLE}.tar.gz not found in release \${VERSION}"
+                  exit 1
+              fi
+              curl -4fsSL "\${AUTH_HEADER[@]}" -H "Accept: application/octet-stream" \\
+                  -o "\${BUNDLE}.tar.gz" "\$ASSET_API_URL" || {
+                  echo "ERROR: Authenticated download failed."
+                  exit 1
+              }
+          else
+              # Public path: browser download URL works without auth.
+              curl -4fsSL -o "\${BUNDLE}.tar.gz" "\$BROWSER_URL" || {
+                  echo "ERROR: Download failed. If \${REPO} is private, export GITHUB_TOKEN."
+                  exit 1
+              }
+          fi
+
+          tar xzf "\${BUNDLE}.tar.gz"
+          cd "\${BUNDLE}"
+          exec bash pve-dedicated.sh "\$@"
+          INSTALLER
+
+          chmod +x "../dist/install.sh"
+
+      - name: Upload premium bundle to Cloudflare R2
+        if: steps.version.outputs.flavor == 'premium'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PREFIX: ${{ vars.R2_PREFIX }}
+          R2_JURISDICTION: ${{ vars.R2_JURISDICTION }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${R2_ACCOUNT_ID:-}" ]]; then
+            echo "::warning::R2_* secrets not configured; skipping R2 upload."
+            echo "  Set: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY"
+            echo "  Optional vars:"
+            echo "    R2_BUCKET       (default: corelix-premium)"
+            echo "    R2_PREFIX       (default: pve-dedicated)"
+            echo "    R2_JURISDICTION (default: 'default'; use 'eu' for EU buckets, 'fedramp' for FedRAMP)"
+            exit 0
+          fi
+          chmod +x scripts/upload_premium_to_r2.sh
+          bash scripts/upload_premium_to_r2.sh \
+            --bundle "dist/pve-dedicated-${{ steps.version.outputs.version }}.tar.gz" \
+            --version "${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: pve-dedicated ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/pve-dedicated-${{ steps.version.outputs.version }}.tar.gz
+            dist/install.sh
+          body: |
+            ## pve-dedicated ${{ steps.version.outputs.version }}
+
+            Multi-provider Proxmox VE installer for **Hetzner** and **OVH** dedicated servers.
+
+            ### Public install (one-liner, no auth)
+            ```bash
+            curl -4fsSL https://github.com/corelix-io/pve-dedicated-public/releases/latest/download/install.sh | bash
+            ```
+
+            ### Premium install (private source, requires PAT)
+            Premium clients receive a fine-grained PAT with `Contents: Read` on
+            `corelix-io/pve-dedicated`. From the rescue shell:
+            ```bash
+            export GITHUB_TOKEN="github_pat_..."
+            curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
+                https://raw.githubusercontent.com/corelix-io/pve-dedicated/main/install.sh \
+                | bash -s -- --provider ovh --enable-luks --unattended --config myserver.env
+            ```
+            The token is forwarded into the installer environment so the
+            release tarball download authenticates against the GitHub asset API.
+
+            ### Premium feature: host-level LUKS encryption
+            Full-disk encryption with passphrase + remote SSH unlock + TPM auto-unlock.
+            See https://corelix.io/pve-dedicated-premium
+
+            ---
+            *Provided freely by [Corelix.io](https://corelix.io) - Made in France*

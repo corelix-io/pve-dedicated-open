@@ -1,0 +1,42 @@
+# Proxmox VE Network Interfaces Template
+# Placeholders: {{INTERFACE_NAME}}, {{MAIN_IPV4_CIDR}}, {{MAIN_IPV4_GW}},
+#               {{MAC_ADDRESS}}, {{IPV6_CIDR}}, {{PRIVATE_IP_CIDR}},
+#               {{PRIVATE_SUBNET}}, {{FIRST_IPV6_CIDR}}
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+iface lo inet6 loopback
+
+iface {{INTERFACE_NAME}} inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address {{MAIN_IPV4_CIDR}}
+    gateway {{MAIN_IPV4_GW}}
+    bridge-ports {{INTERFACE_NAME}}
+    bridge-stp off
+    bridge-fd 1
+    bridge-vlan-aware yes
+    bridge-vids 2-4094
+    pointopoint {{MAIN_IPV4_GW}}
+
+iface vmbr0 inet6 static
+    address {{IPV6_CIDR}}
+    gateway fe80::1
+
+auto vmbr1
+iface vmbr1 inet static
+    address {{PRIVATE_IP_CIDR}}
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    post-up   iptables -t nat -A POSTROUTING -s '{{PRIVATE_SUBNET}}' -o vmbr0 -j MASQUERADE
+    post-down iptables -t nat -D POSTROUTING -s '{{PRIVATE_SUBNET}}' -o vmbr0 -j MASQUERADE
+    post-up   iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1
+    post-down iptables -t raw -D PREROUTING -i fwbr+ -j CT --zone 1
+
+iface vmbr1 inet6 static
+    address {{FIRST_IPV6_CIDR}}

@@ -1,0 +1,80 @@
+name: Leakage Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  leakage-check:
+    name: Strip and assert no premium leakage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run strip_premium.sh against the working tree
+        run: |
+          chmod +x scripts/strip_premium.sh
+          bash scripts/strip_premium.sh --src . --dst /tmp/leakcheck
+
+      - name: Assert leakage greps return zero hard hits
+        run: |
+          set -euo pipefail
+          DST=/tmp/leakcheck
+          fail=0
+
+          # Allowlists must be kept in sync with scripts/strip_premium.sh.
+          # PREMIUM_ONLY_ALLOWLIST: paths that legitimately contain the
+          #   literal "PREMIUM-ONLY" marker (the leakage workflow itself).
+          # LIB_PREMIUM_ALLOWLIST: paths where references to "lib/premium"
+          #   are deliberate public design (loader hook, stub-override
+          #   docs, architecture diagrams, contributor guide, release notes,
+          #   release.yml's public-flavor strip step, this workflow).
+          PREMIUM_ONLY_ALLOWLIST=( ".github/workflows/leakage-check.yml" )
+          LIB_PREMIUM_ALLOWLIST=(
+              "pve-dedicated.sh"
+              "lib/providers/common.sh"
+              ".github/workflows/leakage-check.yml"
+              ".github/workflows/release.yml"
+              "README.md"
+              "docs/CONTRIBUTING.md"
+              "docs/CHANGELOG.md"
+              "scripts/build_bundle.sh"
+          )
+
+          allowed() {
+              local rel="$1" list_name="$2" allowed_path
+              local -n list_ref="$list_name"
+              for allowed_path in "${list_ref[@]}"; do
+                  [[ "$rel" == "$allowed_path" ]] && return 0
+              done
+              return 1
+          }
+
+          mapfile -t marker_hits < <(grep -rln --binary-files=without-match "PREMIUM-ONLY" "$DST" 2>/dev/null || true)
+          for hit in "${marker_hits[@]}"; do
+              [[ -z "$hit" ]] && continue
+              rel="${hit#"${DST}"/}"
+              if allowed "$rel" PREMIUM_ONLY_ALLOWLIST; then continue; fi
+              echo "ERROR: ${rel} contains PREMIUM-ONLY outside the allowlist" >&2
+              fail=1
+          done
+
+          mapfile -t hits < <(grep -rln --binary-files=without-match "lib/premium" "$DST" 2>/dev/null || true)
+          for hit in "${hits[@]}"; do
+              [[ -z "$hit" ]] && continue
+              rel="${hit#"${DST}"/}"
+              if allowed "$rel" LIB_PREMIUM_ALLOWLIST; then continue; fi
+              echo "ERROR: ${rel} references lib/premium outside the allowlist" >&2
+              fail=1
+          done
+
+          if (( fail != 0 )); then
+              exit 1
+          fi
+          echo "OK: leakage check passed"
