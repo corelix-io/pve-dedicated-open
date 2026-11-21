@@ -1,0 +1,19 @@
+# Tang on the host network: the host firewall (ufw/nftables) filters it
+# directly. A published Docker port would bypass ufw.
+services:
+  tang:
+    build: .
+    image: local/tang:15
+    container_name: tang
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TANG_PORT: "7500"
+    volumes:
+      - tang-keys:/var/lib/tang
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  tang-keys:

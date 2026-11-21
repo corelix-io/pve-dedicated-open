@@ -1,0 +1,151 @@
+name: Build Release Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v3.0.0)'
+        required: true
+      flavor:
+        description: 'Build flavor: premium (full) or public (stripped)'
+        required: false
+        default: 'premium'
+        type: choice
+        options:
+          - premium
+          - public
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_FLAVOR: ${{ github.event.inputs.flavor }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="$INPUT_VERSION"
+            flavor="${INPUT_FLAVOR:-premium}"
+          else
+            version="$GITHUB_REF_NAME"
+            flavor="premium"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '${version}' (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          case "$flavor" in premium|public) ;; *) echo "::error::Invalid flavor"; exit 1 ;; esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "flavor=${flavor}" >> "$GITHUB_OUTPUT"
+
+      - name: ShellCheck and unit tests
+        run: |
+          shopt -s nullglob
+          shellcheck -x pve-dedicated.sh install.sh lib/*.sh lib/*/*.sh scripts/*.sh tests/*.sh
+          bash tests/run-all.sh
+
+      - name: Build release bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          FLAVOR: ${{ steps.version.outputs.flavor }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/build_bundle.sh --version "$VERSION" --flavor "$FLAVOR" --output dist
+
+          # Per-release bootstrap: the repo's install.sh pinned to this tag.
+          sed -e "s|^VERSION=\"\${PVE_DEDICATED_VERSION:-latest}\"|VERSION=\"\${PVE_DEDICATED_VERSION:-${VERSION}}\"|" \
+              -e "s|corelix-io/pve-dedicated}\"|${REPO}}\"|" \
+              install.sh > dist/install.sh
+          grep -q "PVE_DEDICATED_VERSION:-${VERSION}" dist/install.sh
+          chmod +x dist/install.sh
+
+          ( cd dist && sha256sum "pve-dedicated-${VERSION}.tar.gz" install.sh > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Upload premium bundle to Cloudflare R2
+        if: steps.version.outputs.flavor == 'premium'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PREFIX: ${{ vars.R2_PREFIX }}
+          R2_JURISDICTION: ${{ vars.R2_JURISDICTION }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${R2_ACCOUNT_ID:-}" ]]; then
+            echo "::warning::R2_* secrets not configured; skipping R2 upload."
+            echo "  Set: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY"
+            echo "  Optional vars:"
+            echo "    R2_BUCKET       (default: corelix-premium)"
+            echo "    R2_PREFIX       (default: pve-dedicated)"
+            echo "    R2_JURISDICTION (default: 'default'; use 'eu' for EU buckets, 'fedramp' for FedRAMP)"
+            exit 0
+          fi
+          chmod +x scripts/upload_premium_to_r2.sh
+          bash scripts/upload_premium_to_r2.sh \
+            --bundle "dist/pve-dedicated-${{ steps.version.outputs.version }}.tar.gz" \
+            --version "${{ steps.version.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: pve-dedicated ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: |
+            dist/pve-dedicated-${{ steps.version.outputs.version }}.tar.gz
+            dist/install.sh
+            dist/SHA256SUMS
+          body: |
+            ## pve-dedicated ${{ steps.version.outputs.version }}
+
+            Multi-provider Proxmox VE installer for **Hetzner** and **OVH** dedicated servers.
+
+            ### Public install (one-liner, no auth)
+            ```bash
+            curl -4fsSL https://github.com/corelix-io/pve-dedicated-open/releases/latest/download/install.sh | bash
+            ```
+
+            ### Premium install (private source, requires PAT)
+            Premium clients receive a fine-grained PAT with `Contents: Read` on
+            `corelix-io/pve-dedicated`. From the rescue shell:
+            ```bash
+            export GITHUB_TOKEN="github_pat_..."
+            curl -4fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                https://raw.githubusercontent.com/corelix-io/pve-dedicated/main/install.sh \
+                | bash -s -- --provider ovh --enable-luks --unattended --config myserver.env
+            ```
+            The token is forwarded into the installer environment so the
+            release tarball download authenticates against the GitHub asset API.
+            Every bundle is verified against the release's `SHA256SUMS` before it runs.
+
+            ### Premium feature: host-level LUKS encryption
+            Full-disk encryption with passphrase + remote SSH unlock + TPM auto-unlock.
+            See https://corelix.io/pve-dedicated-premium
+
+            ---
+            *Provided freely by [Corelix.io](https://corelix.io) - Made in France*

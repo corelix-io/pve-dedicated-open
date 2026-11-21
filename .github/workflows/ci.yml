@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: ShellCheck and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shopt -s nullglob
+          shellcheck -x pve-dedicated.sh install.sh lib/*.sh lib/*/*.sh scripts/*.sh tests/*.sh
+
+      - name: Unit tests
+        run: bash tests/run-all.sh
+
+  worker:
+    name: License Worker (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect Worker
+        id: detect
+        run: |
+          if [[ -f workers/license-redirect/package.json ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: workers/license-redirect/package-lock.json
+
+      - name: Install, typecheck, test
+        if: steps.detect.outputs.present == 'true'
+        working-directory: workers/license-redirect
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
